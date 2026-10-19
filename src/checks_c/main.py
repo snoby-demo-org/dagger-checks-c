@@ -12,7 +12,7 @@ Functions:
 
 Toolchain: ubuntu:24.04 + build-essential/autoconf/libcurl/libjansson/openssl/
 libgmp/libhwloc, ccache volume for incremental rebuilds (cache contract P3).
-Run: dagger call --mod github.com/snoby-demo-org/dagger-checks-c c-build --source=.
+Run: dagger call --mod github.com/snoby-demo-org/dagger-checks-c build --source=.
 """
 
 import json
@@ -32,7 +32,7 @@ set -u
 cd /src
 STATUS=ok
 STAGE=patch
-log() { echo "[c-build] $*"; }
+log() { echo "[build] $*"; }
 
 {
   log "stage=patch"
@@ -115,8 +115,8 @@ def _toolchain() -> dagger.Container:
 @object_type
 class ChecksC:
     @function
-    async def c_build(self, source: dagger.Directory, jobs: int | None = None) -> str:
-        """REAL — C/C++ build check: patch -> configure -> make (FR-73).
+    async def build(self, source: dagger.Directory, jobs: int | None = None) -> str:
+        """REAL — the C/C++ BUILD LEG (not a scan check): patch -> configure -> make (FR-73).
 
         Fails when patch/configure/make fails or no binary is produced.
         Warnings are counted and reported; they do not fail the check.
@@ -138,14 +138,14 @@ class ChecksC:
         binary = (await ctr.file("/tmp/binary.txt").contents()).strip() if status["status"] == "ok" else ""
 
         payload = {
-            "check": "c-build",
+            "check": "build",
             "tool": f"autotools@{TOOLCHAIN_IMAGE}",
             "status": "pass" if status["status"] == "ok" else "fail",
             "failed_stage": status.get("failed_stage") if status["status"] != "ok" else None,
             "warnings": status.get("warnings", 0),
             "binary": binary.splitlines()[0] if binary else None,
         }
-        lines = ["=" * 50, " [c-build] patch -> configure -> make (real)"]
+        lines = ["=" * 50, " [build] patch -> configure -> make (real)"]
         lines.append(console.strip())
         if binary:
             lines.append(f"  version: {binary.splitlines()[0][:100]}")
@@ -160,6 +160,6 @@ class ChecksC:
                 log = console
             tail = "\n".join(log.splitlines()[-60:])
             raise RuntimeError(
-                f"c-build FAILED at stage={status['failed_stage']}\n{tail}"
+                f"build FAILED at stage={status['failed_stage']}\n{tail}"
             )
         return "\n".join(lines)
