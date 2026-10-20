@@ -4,30 +4,45 @@ Language-specific module per the TrueNorth per-language-module decision:
 patch -> configure -> make, entirely inside a pinned toolchain container
 (no runner labels, no host toolchain — FR-73/FR-7/NFR-4).
 
-Build contract — the repo controls the build with files in its root
-(presence-detected, no config; canonical doc: goldenpath TechDocs,
-"TrueNorth build contract"):
+Build contract — repo-side control files (presence-detected, no config;
+canonical doc: goldenpath TechDocs, "TrueNorth build contract"). Actual
+stage flow: patch -> configure-or-build.sh -> make; the make stage ALWAYS
+runs last in both paths:
 
-    patch      patches/*.patch applied with `patch -p1` in glob order
-               -> patch_failed
-    configure  autogen.sh if present (fresh clone's shipped configure can be
-               stale vs Makefile.am), else ./configure
-               -> autogen_failed / configure_failed / no_configure
-    build      build.sh if present — OWNS the whole build (its own
-               configure+make; the generic path does not run); else generic
-               make -j"$(nproc)" -> build_failed / make_failed
+    1. patch      patches/*.patch applied with `patch -p1` in glob order
+                  -> status patch_failed, stage patch
+    2. WITH build.sh:    autogen.sh (if present) -> ./build.sh
+                         -> autogen_failed / build_failed, stage build.sh
+       WITHOUT build.sh: autogen.sh (if present) -> ./configure
+                         -> autogen_failed / configure_failed, stage
+                         configure; no_configure when neither autogen.sh
+                         nor an executable ./configure exists
+    3. make       make -j"$(nproc)" (or -j<jobs> via the jobs param) runs
+                  last in BOTH paths -> make_failed, stage make
+
+build.sh replaces only the generic configure stage; make still runs after
+it (a build.sh that leaves the tree unmakeable fails with make_failed).
+Known wart — full-takeover semantics (skip generic make when build.sh
+exists) is a proposed v1.1.1 change, pending decision.
 
 The check FAILS on any stage failure or when no ELF binary (cpuminer*/
-minerd*) is produced; the failing stage's last 60 log lines are surfaced.
-Warnings are counted and reported; they do not fail.
+minerd*, executable, maxdepth 2, magic 7f454c46) is found -> status
+no_binary. Warnings are counted from make.log and reported; they do not
+fail. On failure the module raises RuntimeError with the failing stage's
+last 60 log lines; the TRUENORTH_RESULT line is emitted on PASS only.
 
-Result contract (FR-7): TRUENORTH_RESULT {"check":"build","tool":
-"autotools@ubuntu:24.04","status","failed_stage","warnings","binary"}.
+Result contract (FR-7), emitted as "TRUENORTH_RESULT: {json}":
+  {"check":"build","tool":"autotools@ubuntu:24.04","status":"pass|fail",
+   "failed_stage":null|"patch"|"configure"|"build.sh"|"make",
+   "warnings":N,"binary":"<first line of --version output>"}
+Internal status strings (patch_failed etc.) appear only in console
+[build] lines, not in the payload.
 
-Matrix (contract documented in goldenpath, machinery pending): build
-variants (e.g. -march per CPU target) fan out per-variant with env exported
-before the hook chain; each result carries a "variant" field; the check
-fails if ANY variant fails.
+Matrix: NOT IMPLEMENTED in this module — no variant fan-out or "variant"
+field exists yet; documented contract only (goldenpath, machinery pending):
+build variants (e.g. -march per CPU target) would fan out per-variant with
+env exported before the hook chain; each result carries a "variant" field;
+the check fails if ANY variant fails.
 
 Toolchain: ubuntu:24.04 + build-essential/autoconf/libcurl/libjansson/openssl/
 libgmp/libhwloc, ccache volume for incremental rebuilds (cache contract P3).
