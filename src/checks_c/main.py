@@ -4,11 +4,30 @@ Language-specific module per the TrueNorth per-language-module decision:
 patch -> configure -> make, entirely inside a pinned toolchain container
 (no runner labels, no host toolchain — FR-73/FR-7/NFR-4).
 
-Functions:
-    c-build   — the full build check: apply patches/*.patch (if present),
-                autogen+configure, make; emits the FR-7 contract line
-                TRUENORTH_RESULT {"check":"c-build",...} and FAILS when the
-                build fails or no binary is produced.
+Build contract — the repo controls the build with files in its root
+(presence-detected, no config; canonical doc: goldenpath TechDocs,
+"TrueNorth build contract"):
+
+    patch      patches/*.patch applied with `patch -p1` in glob order
+               -> patch_failed
+    configure  autogen.sh if present (fresh clone's shipped configure can be
+               stale vs Makefile.am), else ./configure
+               -> autogen_failed / configure_failed / no_configure
+    build      build.sh if present — OWNS the whole build (its own
+               configure+make; the generic path does not run); else generic
+               make -j"$(nproc)" -> build_failed / make_failed
+
+The check FAILS on any stage failure or when no ELF binary (cpuminer*/
+minerd*) is produced; the failing stage's last 60 log lines are surfaced.
+Warnings are counted and reported; they do not fail.
+
+Result contract (FR-7): TRUENORTH_RESULT {"check":"build","tool":
+"autotools@ubuntu:24.04","status","failed_stage","warnings","binary"}.
+
+Matrix (contract documented in goldenpath, machinery pending): build
+variants (e.g. -march per CPU target) fan out per-variant with env exported
+before the hook chain; each result carries a "variant" field; the check
+fails if ANY variant fails.
 
 Toolchain: ubuntu:24.04 + build-essential/autoconf/libcurl/libjansson/openssl/
 libgmp/libhwloc, ccache volume for incremental rebuilds (cache contract P3).
