@@ -20,8 +20,24 @@ runs last in both paths:
     3. make       make -j"$(nproc)" (or -j<jobs> via the jobs param) runs
                   last in BOTH paths -> make_failed, stage make
 
-build.sh replaces only the generic configure stage; make still runs after
-it (a build.sh that leaves the tree unmakeable fails with make_failed).
+DECLARED HOOKS (SHIPPED v1.1.1 — the preferred control surface): declare
+explicit command lines in the repo's own .github/truenorth.yaml:
+
+    build:
+      module: github.com/snoby-demo-org/dagger-checks-c@v1.1.1
+      hooks:
+        autogen:   ./autogen.sh                  # optional
+        configure: ./configure --with-curl       # optional
+        make:      make clean && make -j"$(nproc)"  # optional
+
+The module self-reads hooks from the mounted source (no workflow changes;
+values are single-line commands, no inline comments, run via bash -c in
+/src). DECLARED MODE: only the declared stages run, in autogen->configure->
+make order — build.sh and generic make are IGNORED; anything left undeclared
+is skipped (a missing make shows up as no_binary). Legacy presence path is
+unchanged and still applies when no hooks are declared (incl. the known
+wart: generic make runs after build.sh).
+
 Known wart — full-takeover semantics (skip generic make when build.sh
 exists) is a proposed v1.1.1 change, pending decision.
 
@@ -79,7 +95,26 @@ log() { echo "[build] $*"; }
     log "no patches to apply"
   fi
 
-  if [ "$STATUS" = ok ] && [ -f ./build.sh ]; then
+  HOOKS_DECLARED=""
+  if [ -n "${TN_HOOK_AUTOGEN:-}" ] || [ -n "${TN_HOOK_CONFIGURE:-}" ] || [ -n "${TN_HOOK_MAKE:-}" ]; then
+    HOOKS_DECLARED=1
+    log "declared hooks mode (build.sh and generic stages ignored)"
+    if [ "$STATUS" = ok ] && [ -n "${TN_HOOK_AUTOGEN:-}" ]; then
+      STAGE=autogen
+      log "stage=autogen (declared)"
+      bash -c "$TN_HOOK_AUTOGEN" > /tmp/configure.log 2>&1 || STATUS="autogen_failed"
+    fi
+    if [ "$STATUS" = ok ] && [ -n "${TN_HOOK_CONFIGURE:-}" ]; then
+      STAGE=configure
+      log "stage=configure (declared)"
+      bash -c "$TN_HOOK_CONFIGURE" > /tmp/configure.log 2>&1 || STATUS="configure_failed"
+    fi
+    if [ "$STATUS" = ok ] && [ -n "${TN_HOOK_MAKE:-}" ]; then
+      STAGE=make
+      log "stage=make (declared)"
+      bash -c "$TN_HOOK_MAKE" > /tmp/make.log 2>&1 || STATUS="make_failed"
+    fi
+  elif [ "$STATUS" = ok ] && [ -f ./build.sh ]; then
     STAGE=build.sh
     log "stage=build.sh (project's own build script)"
     if [ -f ./autogen.sh ]; then
@@ -104,7 +139,9 @@ log() { echo "[build] $*"; }
     fi
   fi
 
-  if [ "$STATUS" = ok ]; then
+  # generic make: legacy paths only — in declared mode the make hook IS the
+  # make stage; anything not declared does not run
+  if [ "$STATUS" = ok ] && [ -z "$HOOKS_DECLARED" ]; then
     STAGE=make
     log "stage=make ($(nproc) jobs)"
     make -j"$(nproc)" > /tmp/make.log 2>&1 || STATUS="make_failed"
@@ -133,6 +170,64 @@ exit 0
 """
 
 
+_HOOK_KEYS = ("autogen", "configure", "make")
+
+
+def _parse_hooks(text: str) -> dict[str, str]:
+    """Extract build.hooks.{autogen,configure,make} from truenorth.yaml.
+
+    Minimal line-based parse of our own template-controlled schema (the
+    module runtime has no pyyaml): a top-level `build:` block, an indented
+    `hooks:` mapping inside it, single-line `key: value` entries. Values are
+    used verbatim (outer quotes stripped); unknown keys are ignored.
+    """
+    hooks: dict[str, str] = {}
+    top = None          # current top-level key
+    seen_build = False  # a build: key seen inside the current top-level block
+    in_hooks = False
+    hooks_indent = -1
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            key0 = key0.strip()
+            val0 = val0.strip()
+            top = key0
+            # a top-level build: block counts as "seen build" too
+            seen_build = key0 == "build" and not val0
+            in_hooks = False
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        # hooks may live under a top-level build: block or under checks: -> build:
+        if top not in ("checks", "build"):
+            continue
+        if key == "build" and not val:
+            seen_build = True
+            continue
+        if key == "hooks" and not val and seen_build:
+            in_hooks = True
+            hooks_indent = indent
+            continue
+        if in_hooks:
+            if indent > hooks_indent:
+                if key in _HOOK_KEYS and val:
+                    # strip a fully-quoted wrapper only ("..." / '...') —
+                    # never naive both-ends stripping (make -j"$(nproc)")
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                        val = val[1:-1]
+                    hooks[key] = val
+                continue
+            in_hooks = False
+    return hooks
+
+
 def _toolchain() -> dagger.Container:
     return (
         dag.container()
@@ -159,10 +254,18 @@ class ChecksC:
             script = BUILD_SCRIPT.replace('make -j"$(nproc)"', f"make -j{jobs}")
         else:
             script = BUILD_SCRIPT
+        try:
+            cfg = await source.file(".github/truenorth.yaml").contents()
+            hooks = _parse_hooks(cfg)
+        except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
+            hooks = {}
         ctr = (
             _toolchain()
             .with_mounted_directory("/src", source)
             .with_workdir("/src")
+            .with_env_variable("TN_HOOK_AUTOGEN", hooks.get("autogen", ""))
+            .with_env_variable("TN_HOOK_CONFIGURE", hooks.get("configure", ""))
+            .with_env_variable("TN_HOOK_MAKE", hooks.get("make", ""))
             .with_new_file("/tmp/build.sh", script)
             .with_exec(["bash", "/tmp/build.sh"])
         )
