@@ -54,11 +54,14 @@ Result contract (FR-7), emitted as "TRUENORTH_RESULT: {json}":
 Internal status strings (patch_failed etc.) appear only in console
 [build] lines, not in the payload.
 
-Matrix: NOT IMPLEMENTED in this module — no variant fan-out or "variant"
-field exists yet; documented contract only (goldenpath, machinery pending):
-build variants (e.g. -march per CPU target) would fan out per-variant with
-env exported before the hook chain; each result carries a "variant" field;
-the check fails if ANY variant fails.
+Matrix (v1.1.2 — SHIPPED, workflow fan-out): the reusable workflow
+(truenorth-v2.1+) parses checks.build.matrix (mapping form, {id: {env, hooks}})
+and fans ONE runner pod per id, calling build(--variant=<id>) in parallel.
+The variant's env is exported before the hook chain; its hooks override the
+base hooks per slot; the payload gains "variant": "<id>". No matrix: block
+= single implicit variant (no --variant flag, payload unchanged). Unknown
+variant -> hard error naming the declared ids. The check fails if ANY
+variant job fails (workflow-level aggregation, truenorth_report.py).
 
 Toolchain: ubuntu:24.04 + build-essential/autoconf/libcurl/libjansson/openssl/
 libgmp/libhwloc, ccache volume for incremental rebuilds (cache contract P3).
@@ -184,8 +187,13 @@ def _parse_hooks(text: str) -> dict[str, str]:
     hooks: dict[str, str] = {}
     top = None          # current top-level key
     seen_build = False  # a build: key seen inside the current top-level block
+    seen_matrix = False # matrix: seen -> base hooks block closed forever
+                        # (variant hooks only exist UNDER matrix ids)
     in_hooks = False
     hooks_indent = -1
+    leaf_indent = -1    # indent of the first captured leaf; later leaves must
+                        # match it exactly, so deeper-nested sections (a
+                        # variant's hooks: leaves) can never be absorbed here
     for ln in text.splitlines():
         if not ln.strip() or ln.lstrip().startswith("#"):
             continue
@@ -198,6 +206,7 @@ def _parse_hooks(text: str) -> dict[str, str]:
             top = key0
             # a top-level build: block counts as "seen build" too
             seen_build = key0 == "build" and not val0
+            seen_matrix = False
             in_hooks = False
             continue
         if ":" not in stripped:
@@ -210,22 +219,180 @@ def _parse_hooks(text: str) -> dict[str, str]:
             continue
         if key == "build" and not val:
             seen_build = True
+            seen_matrix = False
+            in_hooks = False
             continue
-        if key == "hooks" and not val and seen_build:
+        if key == "matrix" and not val and seen_build:
+            seen_matrix = True
+            in_hooks = False
+            continue
+        if key == "hooks" and not val and seen_build and not seen_matrix and not in_hooks:
             in_hooks = True
             hooks_indent = indent
+            leaf_indent = -1
             continue
         if in_hooks:
-            if indent > hooks_indent:
-                if key in _HOOK_KEYS and val:
-                    # strip a fully-quoted wrapper only ("..." / '...') —
-                    # never naive both-ends stripping (make -j"$(nproc)")
-                    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-                        val = val[1:-1]
-                    hooks[key] = val
+            # hook leaves: same indent as the first leaf, non-empty value.
+            # Anything else — dedent to a sibling section, an empty-val header
+            # (a nested matrix:/hooks:), an indent jump — closes the block.
+            if (val and indent > hooks_indent
+                    and (leaf_indent == -1 or indent == leaf_indent)):
+                if key in _HOOK_KEYS:
+                    hooks[key] = _strip_outer_quotes(val)
+                if leaf_indent == -1:
+                    leaf_indent = indent
                 continue
             in_hooks = False
     return hooks
+
+
+def _strip_outer_quotes(val: str) -> str:
+    """Strip a fully-quoted wrapper only ("..." / '...') — never naive
+    both-ends stripping (make -j"$(nproc)")."""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        return val[1:-1]
+    return val
+
+
+def _split_flow(s: str) -> list[str]:
+    """Split a single-line YAML flow mapping body on top-level commas
+    (quote-aware, escape-aware): 'MARCH: znver2, FOO: "a, b"' ->
+    ['MARCH: znver2', 'FOO: "a, b"']. Handles backslash escapes inside
+    double quotes and YAML doubled single quotes ('' -> ')."""
+    parts: list[str] = []
+    buf: list[str] = []
+    q = None
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if q:
+            if q == '"' and ch == "\\" and i + 1 < n:
+                nxt = s[i + 1]
+                if nxt in ('"', "\\"):
+                    buf.append(nxt)      # YAML unescape: \" -> " and \\ -> \
+                else:
+                    buf.append(ch)       # unknown escape: keep verbatim
+                    buf.append(nxt)
+                i += 2
+                continue
+            if q == "'" and ch == "'" and i + 1 < n and s[i + 1] == "'":
+                buf.append("'")          # YAML doubled single quote -> literal '
+                i += 2
+                continue
+            buf.append(ch)
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+            buf.append(ch)
+        elif ch == ",":
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _parse_matrix(text: str) -> dict[str, dict]:
+    """Extract checks.build.matrix as {variant_id: {"env": {...}, "hooks": {...}}}.
+
+    Mapping form (template-controlled schema, same minimal line-based parse
+    as _parse_hooks — the module runtime has no pyyaml):
+
+        checks:
+          build:
+            matrix:
+              amd-znver2:
+                env:
+                  MARCH: znver2
+                hooks:                      # optional per-variant hook override
+                  configure: ./configure --foo
+              intel-x86-64v2:
+                env:
+                  MARCH: x86-64-v2
+
+    env values and hook lines are verbatim (outer quotes stripped); unknown
+    sub-keys are ignored. env/hooks accept block form or single-line flow
+    mappings (env: { MARCH: znver2 }). The reusable workflow (truenorth-v2.1)
+    fans one runner pod per id and calls build(--variant=<id>).
+    """
+    entries: dict[str, dict] = {}
+    top = None
+    seen_build = False
+    in_matrix = False
+    matrix_indent = -1
+    cur_id = None
+    cur_sec = None       # "env" | "hooks" | None
+    sec_indent = -1
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            top = key0.strip()
+            seen_build = top == "build" and not val0.strip()
+            in_matrix = False
+            cur_id = None
+            cur_sec = None
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if top not in ("checks", "build"):
+            continue
+        if key == "build" and not val:
+            seen_build = True
+            in_matrix = False
+            cur_id = None
+            cur_sec = None
+            continue
+        if key == "matrix" and not val and seen_build:
+            in_matrix = True
+            matrix_indent = indent
+            cur_id = None
+            cur_sec = None
+            continue
+        if not in_matrix:
+            continue
+        if indent <= matrix_indent:      # dedent: matrix block ended
+            in_matrix = False
+            cur_id = None
+            cur_sec = None
+            continue
+        if cur_sec is not None and indent > sec_indent:
+            # leaf of the current env/hooks section
+            if val:
+                entries[cur_id][cur_sec][key] = _strip_outer_quotes(val)
+            continue
+        if key in ("env", "hooks") and cur_id is not None:
+            # section header (block form) or a single-line flow mapping:
+            #   env: { MARCH: znver2, JOBS: "4" }
+            if not val:
+                cur_sec = key
+                sec_indent = indent
+            elif val.startswith("{") and val.endswith("}"):
+                inner = val[1:-1].strip()
+                if inner:
+                    for part in _split_flow(inner):
+                        k2, _, v2 = part.partition(":")
+                        if v2.strip():
+                            entries[cur_id][key][k2.strip()] = _strip_outer_quotes(v2.strip())
+                cur_sec = None
+            continue
+        if not val:                       # a new variant id
+            cur_id = key
+            entries[cur_id] = {"env": {}, "hooks": {}}
+            cur_sec = None
+            sec_indent = indent
+    return entries
 
 
 def _toolchain() -> dagger.Container:
@@ -244,11 +411,18 @@ def _toolchain() -> dagger.Container:
 @object_type
 class ChecksC:
     @function
-    async def build(self, source: dagger.Directory, jobs: int | None = None) -> str:
+    async def build(self, source: dagger.Directory, jobs: int | None = None,
+                    variant: str = "") -> str:
         """REAL — the C/C++ BUILD LEG (not a scan check): patch -> configure -> make (FR-73).
 
         Fails when patch/configure/make fails or no binary is produced.
         Warnings are counted and reported; they do not fail the check.
+
+        Matrix variants (dagger-checks-c@v1.1.2): the reusable workflow fans
+        one runner pod per id in checks.build.matrix and calls build with
+        --variant=<id>. The variant's env is exported before the hook chain
+        and its hooks: override the base hooks per slot; the result payload
+        gains a "variant" field. Unknown variant -> hard error.
         """
         if jobs:
             script = BUILD_SCRIPT.replace('make -j"$(nproc)"', f"make -j{jobs}")
@@ -257,12 +431,28 @@ class ChecksC:
         try:
             cfg = await source.file(".github/truenorth.yaml").contents()
             hooks = _parse_hooks(cfg)
+            matrix = _parse_matrix(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
-            hooks = {}
+            hooks, matrix = {}, {}
+        venv: dict[str, str] = {}
+        if variant:
+            if variant not in matrix:
+                raise RuntimeError(
+                    f"unknown build variant '{variant}' — declared in "
+                    f"truenorth.yaml: {sorted(matrix) or 'NONE (no matrix block)'}")
+            entry = matrix[variant]
+            venv = {k: v for k, v in (entry.get("env") or {}).items()}
+            # per-variant hook override wins per slot over the base hooks
+            hooks = {**hooks, **{k: v for k, v in (entry.get("hooks") or {}).items() if v}}
         ctr = (
             _toolchain()
             .with_mounted_directory("/src", source)
             .with_workdir("/src")
+        )
+        for k in sorted(venv):
+            ctr = ctr.with_env_variable(k, venv[k])
+        ctr = (
+            ctr
             .with_env_variable("TN_HOOK_AUTOGEN", hooks.get("autogen", ""))
             .with_env_variable("TN_HOOK_CONFIGURE", hooks.get("configure", ""))
             .with_env_variable("TN_HOOK_MAKE", hooks.get("make", ""))
@@ -282,6 +472,8 @@ class ChecksC:
             "warnings": status.get("warnings", 0),
             "binary": binary.splitlines()[0] if binary else None,
         }
+        if variant:
+            payload["variant"] = variant
         lines = ["=" * 50, " [build] patch -> configure -> make (real)"]
         lines.append(console.strip())
         if binary:
