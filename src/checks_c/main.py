@@ -63,8 +63,14 @@ base hooks per slot; the payload gains "variant": "<id>". No matrix: block
 variant -> hard error naming the declared ids. The check fails if ANY
 variant job fails (workflow-level aggregation, truenorth_report.py).
 
-Toolchain: ubuntu:24.04 + build-essential/autoconf/libcurl/libjansson/openssl/
-libgmp/libhwloc, ccache volume for incremental rebuilds (cache contract P3).
+Toolchain: ubuntu:24.04 + build-essential/autoconf/libtool/libcurl/libjansson/
+openssl/libgmp/libhwloc/ncurses/protobuf/qrencode/libdb++ (autotools builds
+whose depends self-hosts rust/bdb/boost need no host rust), ccache volume for
+incremental rebuilds (cache contract P3).
+
+Artifact gate: `build.artifact: <filename-glob>` in truenorth.yaml replaces
+the legacy cpuminer*/minerd* name gate (e.g. `artifact: verusd` finds an ELF
+named verusd at maxdepth 2). Absent key = legacy name gate (back-compat).
 Run: dagger call --mod github.com/snoby-demo-org/dagger-checks-c build --source=.
 """
 
@@ -77,7 +83,12 @@ TOOLCHAIN_IMAGE = "ubuntu:24.04"
 APT_PACKETS = (
     "build-essential autoconf automake pkg-config ccache "
     "libcurl4-openssl-dev libjansson-dev libssl-dev libgmp-dev "
-    "libhwloc-dev zlib1g-dev patch"
+    "libhwloc-dev zlib1g-dev patch "
+    # autotools builds whose depends system self-hosts heavy deps (e.g. veruscoin:
+    # depends downloads rust 1.69 + bdb + boost itself — NO host rustc/cargo needed):
+    "libtool ncurses-dev unzip wget bsdmainutils python3 python-is-python3 "
+    "libprotobuf-dev protobuf-compiler libqrencode-dev libdb++-dev "
+    "git curl ca-certificates"
 )
 
 BUILD_SCRIPT = r"""
@@ -152,9 +163,16 @@ log() { echo "[build] $*"; }
 
   if [ "$STATUS" = ok ]; then
     BIN=""
-    for c in $(find /src -maxdepth 2 -type f -perm -u+x \( -name 'cpuminer*' -o -name 'minerd*' \) 2>/dev/null); do
-      if [ "$(head -c 4 "$c" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then BIN="$c"; break; fi
-    done
+    if [ -n "${TN_ARTIFACT:-}" ]; then
+      log "artifact gate: pattern=$TN_ARTIFACT (build.artifact)"
+      for c in $(find /src -maxdepth 2 -type f -perm -u+x -name "$TN_ARTIFACT" 2>/dev/null); do
+        if [ "$(head -c 4 "$c" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then BIN="$c"; break; fi
+      done
+    else
+      for c in $(find /src -maxdepth 2 -type f -perm -u+x \( -name 'cpuminer*' -o -name 'minerd*' \) 2>/dev/null); do
+        if [ "$(head -c 4 "$c" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then BIN="$c"; break; fi
+      done
+    fi
     if [ -n "$BIN" ]; then
       log "binary: $BIN"
       "$BIN" --version > /tmp/binary.txt 2>&1 || true
@@ -252,6 +270,45 @@ def _strip_outer_quotes(val: str) -> str:
     if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
         return val[1:-1]
     return val
+
+
+def _parse_artifact(text: str) -> str:
+    """Extract build.artifact from truenorth.yaml — a filename GLOB for the
+    artifact gate (e.g. `artifact: verusd`), replacing the legacy
+    cpuminer*/minerd* name gate when present. Sits directly under `build:`
+    (sibling of hooks:/matrix:); per-variant artifacts are out of scope.
+    Empty string when absent (legacy name gate applies)."""
+    top = None
+    seen_build = False
+    seen_matrix = False
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            top = key0.strip()
+            seen_build = top == "build" and not val0.strip()
+            seen_matrix = False
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if top not in ("checks", "build"):
+            continue
+        if key == "build" and not val:
+            seen_build = True
+            seen_matrix = False
+            continue
+        if key == "matrix" and not val and seen_build:
+            seen_matrix = True
+            continue
+        if seen_build and not seen_matrix and key == "artifact" and val:
+            return _strip_outer_quotes(val)
+    return ""
 
 
 def _split_flow(s: str) -> list[str]:
@@ -432,8 +489,9 @@ class ChecksC:
             cfg = await source.file(".github/truenorth.yaml").contents()
             hooks = _parse_hooks(cfg)
             matrix = _parse_matrix(cfg)
+            artifact = _parse_artifact(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
-            hooks, matrix = {}, {}
+            hooks, matrix, artifact = {}, {}, ""
         venv: dict[str, str] = {}
         if variant:
             if variant not in matrix:
@@ -456,6 +514,7 @@ class ChecksC:
             .with_env_variable("TN_HOOK_AUTOGEN", hooks.get("autogen", ""))
             .with_env_variable("TN_HOOK_CONFIGURE", hooks.get("configure", ""))
             .with_env_variable("TN_HOOK_MAKE", hooks.get("make", ""))
+            .with_env_variable("TN_ARTIFACT", artifact)
             .with_new_file("/tmp/build.sh", script)
             .with_exec(["bash", "/tmp/build.sh"])
         )
