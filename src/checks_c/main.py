@@ -311,6 +311,40 @@ def _parse_artifact(text: str) -> str:
     return ""
 
 
+def _parse_build_key(text: str, key: str) -> str:
+    """Extract a scalar key directly under the build block (e.g.
+    `depends_image: registry.viporlab.net/demo/verus-depends:d-abc123`).
+    Empty string when absent."""
+    top = None
+    seen_build = False
+    seen_matrix = False
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            top = stripped.partition(":")[0].strip()
+            seen_build = top == "build" and not stripped.partition(":")[2].strip()
+            seen_matrix = False
+            continue
+        if ":" not in stripped:
+            continue
+        k, _, v = stripped.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if k == "build" and not v:
+            seen_build = True
+            seen_matrix = False
+            continue
+        if k == "matrix" and not v and seen_build:
+            seen_matrix = True
+            continue
+        if seen_build and not seen_matrix and k == key and v:
+            return _strip_outer_quotes(v)
+    return ""
+
+
 def _parse_publish(text: str) -> str:
     """Extract build.publish from truenorth.yaml — the STAGING REPO REF to
     publish the runtime image to after the artifact gate passes (e.g.
@@ -505,69 +539,6 @@ def _toolchain() -> dagger.Container:
     )
 
 
-# Runtime layer (verbatim package list from veruscoin docker/Dockerfile.release
-# final stage) — assembled ON TOP of the already-gated binaries. This is the
-# cheap half of "build once, promote everywhere": the 40-90 min compile is the
-# artifact-gated build; packaging it into the image costs seconds.
-RUNTIME_IMAGE = "ubuntu:20.04"
-RUNTIME_APT = ("software-properties-common bash sudo libminiupnpc-dev "
-               "libzmq3-dev python3 python3-pip wget")
-
-
-async def _stage_commit_sha(source: dagger.Directory) -> str:
-    """Resolve the source tree's commit via git (works with a CI checkout;
-    empty string when .git is absent, e.g. fixture tests)."""
-    try:
-        return (
-            await dag.container()
-            .from_(TOOLCHAIN_IMAGE)
-            .with_mounted_directory("/src", source)
-            .with_workdir("/src")
-            .with_exec(["git", "rev-parse", "HEAD"])
-            .stdout()
-        ).strip()
-    except Exception:  # noqa: BLE001 — no .git (local fixture) -> sha-less tag
-        return ""
-
-
-async def _assemble_runtime_image(
-    source: dagger.Directory, verusd_path: str, verus_cli_path: str,
-    revision: str,
-) -> dagger.Container:
-    """Build the runtime image around the gated binaries (single recipe:
-    package list + entrypoint verbatim from the release Dockerfile's final
-    stage; the binaries come from the artifact-gated build tree, NOT a
-    second compile)."""
-    ctr = (
-        dag.container()
-        .from_(RUNTIME_IMAGE)
-        .with_exec(["sh", "-c",
-                    f"apt update && DEBIAN_FRONTEND=noninteractive apt install "
-                    f"--no-install-recommends -y {RUNTIME_APT} "
-                    f"&& rm -rf /var/lib/apt/lists/*"])
-        .with_exec(["pip3", "install", "flask", "requests"])
-        .with_exec(["sh", "-c",
-                    "useradd -m verus -s /bin/bash "
-                    "&& echo 'verus ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/verus"])
-        .with_file("/usr/local/bin/verusd", source.file(verusd_path))
-        .with_file("/usr/local/bin/verus", source.file(verus_cli_path))
-        .with_file("/usr/local/bin/fetch-params", source.file("zcutil/fetch-params.sh"))
-        .with_file("/usr/local/bin/fetch-bootstrap", source.file("vcutil/fetch-bootstrap.sh"))
-        .with_file("/verus-start-docker.sh", source.file("docker/verus-start-docker.sh"))
-        .with_file("/usr/local/bin/verus_health.py", source.file("docker/verus_health.py"))
-        .with_exec(["sh", "-c",
-                    "chmod +x /usr/local/bin/* /verus-start-docker.sh"])
-        .with_label("org.opencontainers.image.revision", revision)
-        .with_label("org.opencontainers.image.vendor", "snoby-demo-org/veruscoin")
-        .with_exposed_port(27486)
-        .with_exposed_port(27485)
-        .with_exposed_port(17772)
-        .with_exposed_port(8889)
-        .with_entrypoint(["/verus-start-docker.sh"])
-    )
-    return ctr
-
-
 @object_type
 class ChecksC:
     @function
@@ -584,85 +555,111 @@ class ChecksC:
         and its hooks: override the base hooks per slot; the result payload
         gains a "variant" field. Unknown variant -> hard error.
         """
-        if jobs:
-            script = BUILD_SCRIPT.replace('make -j"$(nproc)"', f"make -j{jobs}")
-        else:
-            script = BUILD_SCRIPT
+        # ---- PATH A (v1.4.0): docker/Dockerfile.release present -> the build
+        # IS a docker build (the proven buildx recipe), inside the engine
+        # (BuildKit cache; depends-baker/app-builder layers stay cached across
+        # runs). The gate extracts the binaries FROM the built image; publish
+        # pushes that SAME image by digest. Build once, promote everywhere.
+        dockerfile_present = True
         try:
-            cfg = await source.file(".github/truenorth.yaml").contents()
-            hooks = _parse_hooks(cfg)
-            matrix = _parse_matrix(cfg)
-            artifact = _parse_artifact(cfg)
-            publish_repo = _parse_publish(cfg)
-        except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
-            hooks, matrix, artifact, publish_repo = {}, {}, "", ""
-        venv: dict[str, str] = {}
-        if variant:
-            if variant not in matrix:
+            await source.file("docker/Dockerfile.release").size()
+        except Exception:  # noqa: BLE001
+            dockerfile_present = False
+
+        sha = await _stage_commit_sha(source)
+        img = None
+        if dockerfile_present:
+            bargs = [dagger.BuildArg(name="GIT_SHA", value=sha or "unknown")]
+            if depends_image:
+                bargs.append(dagger.BuildArg(name="DEPENDS_IMAGE", value=depends_image))
+            build_kwargs = {
+                "dockerfile": "docker/Dockerfile.release",
+                "build_args": bargs,
+                "secrets": [],
+            }
+            try:
+                img = await source.docker_build(**build_kwargs)
+            except Exception as e:  # noqa: BLE001 — BuildKit failure text carries the tail
+                tail = "\n".join(str(e).splitlines()[-60:])
+                raise RuntimeError(f"build FAILED at stage=docker-build\n{tail}") from e
+            # GATE: binaries from the built image — ELF magic + version
+            verusd_bytes = await img.file("/usr/local/bin/verusd").contents()
+            if not verusd_bytes.startswith(b"\x7fELF"):
                 raise RuntimeError(
-                    f"unknown build variant '{variant}' — declared in "
-                    f"truenorth.yaml: {sorted(matrix) or 'NONE (no matrix block)'}")
-            entry = matrix[variant]
-            venv = {k: v for k, v in (entry.get("env") or {}).items()}
-            # per-variant hook override wins per slot over the base hooks
-            hooks = {**hooks, **{k: v for k, v in (entry.get("hooks") or {}).items() if v}}
-        ctr = (
-            _toolchain()
-            .with_mounted_directory("/src", source)
-            .with_workdir("/src")
-        )
-        for k in sorted(venv):
-            ctr = ctr.with_env_variable(k, venv[k])
-        ctr = (
-            ctr
-            .with_env_variable("TN_HOOK_AUTOGEN", hooks.get("autogen", ""))
-            .with_env_variable("TN_HOOK_CONFIGURE", hooks.get("configure", ""))
-            .with_env_variable("TN_HOOK_MAKE", hooks.get("make", ""))
-            .with_env_variable("TN_ARTIFACT", artifact)
-            .with_new_file("/tmp/build.sh", script)
-            .with_exec(["bash", "/tmp/build.sh"])
-        )
-        status_raw = await ctr.file("/tmp/cbuild_status.json").contents()
-        console = await ctr.file("/tmp/cbuild_console.log").contents()
-        status = json.loads(status_raw)
-        binary = (await ctr.file("/tmp/binary.txt").contents()).strip() if status["status"] == "ok" else ""
+                    "build FAILED at stage=artifact-gate: /usr/local/bin/verusd "
+                    "in built image is not an ELF binary")
+            try:
+                version = await (
+                    img.with_entrypoint([])
+                    .with_exec(["sh", "-c",
+                                "/usr/local/bin/verusd --version 2>&1 | head -1"])
+                    .stdout()
+                )
+                version = version.strip()
+            except Exception as e:  # noqa: BLE001
+                version = ""
+                lines = [f"  WARN: verusd --version probe failed: {e}"]
+            status = {"status": "ok", "failed_stage": None, "warnings": 0}
+            binary = version
+            payload = {
+                "check": "build",
+                "tool": "docker-build@docker/Dockerfile.release",
+                "status": "pass",
+                "failed_stage": None,
+                "warnings": 0,
+                "binary": version or None,
+            }
+            if variant:
+                payload["variant"] = variant
+            lines = ["=" * 50, " [build] docker/Dockerfile.release (buildx recipe, in-engine)"]
+            if version:
+                lines.append(f"  version: {version[:100]}")
+        else:
+        # ---- PATH B (legacy): native autotools hook chain
+            if jobs:
+                script = BUILD_SCRIPT.replace('make -j"$(nproc)"', f"make -j{jobs}")
+            else:
+                script = BUILD_SCRIPT
+            ctr = (
+                _toolchain()
+                .with_mounted_directory("/src", source)
+                .with_workdir("/src")
+            )
+            for k in sorted(venv):
+                ctr = ctr.with_env_variable(k, venv[k])
+            ctr = (
+                ctr
+                .with_env_variable("TN_HOOK_AUTOGEN", hooks.get("autogen", ""))
+                .with_env_variable("TN_HOOK_CONFIGURE", hooks.get("configure", ""))
+                .with_env_variable("TN_HOOK_MAKE", hooks.get("make", ""))
+                .with_env_variable("TN_ARTIFACT", artifact)
+                .with_new_file("/tmp/build.sh", script)
+                .with_exec(["bash", "/tmp/build.sh"])
+            )
+            status_raw = await ctr.file("/tmp/cbuild_status.json").contents()
+            console = await ctr.file("/tmp/cbuild_console.log").contents()
+            status = json.loads(status_raw)
+            binary = (await ctr.file("/tmp/binary.txt").contents()).strip() if status["status"] == "ok" else ""
+            payload = {
+                "check": "build",
+                "tool": f"autotools@{TOOLCHAIN_IMAGE}",
+                "status": "pass" if status["status"] == "ok" else "fail",
+                "failed_stage": status.get("failed_stage") if status["status"] != "ok" else None,
+                "warnings": status.get("warnings", 0),
+                "binary": binary.splitlines()[0] if binary else None,
+            }
+            if variant:
+                payload["variant"] = variant
+            lines = ["=" * 50, " [build] patch -> configure -> make (real)"]
+            lines.append(console.strip())
+            if binary:
+                lines.append(f"  version: {binary.splitlines()[0][:100]}")
 
-        payload = {
-            "check": "build",
-            "tool": f"autotools@{TOOLCHAIN_IMAGE}",
-            "status": "pass" if status["status"] == "ok" else "fail",
-            "failed_stage": status.get("failed_stage") if status["status"] != "ok" else None,
-            "warnings": status.get("warnings", 0),
-            "binary": binary.splitlines()[0] if binary else None,
-        }
-        if variant:
-            payload["variant"] = variant
-        lines = ["=" * 50, " [build] patch -> configure -> make (real)"]
-        lines.append(console.strip())
-        if binary:
-            lines.append(f"  version: {binary.splitlines()[0][:100]}")
-
-        # PUBLISH STAGE (v1.3.0): when the build block declares
-        # `publish: <staging-repo-ref>`, assemble the runtime image ON TOP of
-        # the gated binaries and push it (build once, promote everywhere —
-        # the digest feeds the digest.txt artifact the test plane and Kargo
-        # consume). Publish failure FAILS the check (blocking leg).
-        if publish_repo and status["status"] == "ok":
-            sha = await _stage_commit_sha(source)
+        # ---- PUBLISH (v1.4.0): push the gated image itself by digest
+        if publish_repo and status["status"] == "ok" and img is not None:
             tag = "sha-" + (sha or "unknown") + (f"-{variant}" if variant else "")
             addr = f"{publish_repo}:{tag}"
-            lines.append(f"  staging: assembling runtime image -> {addr}")
-            # the ELF gate already proved the binaries exist (maxdepth 2);
-            # the standard autotools output dir is src/ (Dockerfile.release
-            # copies /build/src/verusd). Fail loudly if the layout differs.
-            for p in ("src/verusd", "src/verus"):
-                try:
-                    await source.file(p).size()
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"publish: gated binary '{p}' not found in build tree "
-                        f"(artifact gate passed, layout mismatch?): {e}") from e
-            img = await _assemble_runtime_image(source, "src/verusd", "src/verus", sha)
+            lines.append(f"  staging: publishing gated image -> {addr}")
             digest = await img.publish(addr)
             payload["digest"] = digest
             payload["staging"] = addr
