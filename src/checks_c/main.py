@@ -571,6 +571,25 @@ class ChecksC:
         and its hooks: override the base hooks per slot; the result payload
         gains a "variant" field. Unknown variant -> hard error.
         """
+        try:
+            cfg = await source.file(".github/truenorth.yaml").contents()
+            hooks = _parse_hooks(cfg)
+            matrix = _parse_matrix(cfg)
+            artifact = _parse_artifact(cfg)
+            publish_repo = _parse_publish(cfg)
+            depends_image = _parse_build_key(cfg, "depends_image")
+        except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
+            hooks, matrix, artifact, publish_repo, depends_image = {}, {}, "", "", ""
+        venv: dict[str, str] = {}
+        if variant:
+            if variant not in matrix:
+                raise RuntimeError(
+                    f"unknown build variant '{variant}' — declared in "
+                    f"truenorth.yaml: {sorted(matrix) or 'NONE (no matrix block)'}")
+            entry = matrix[variant]
+            venv = {k: v for k, v in (entry.get("env") or {}).items()}
+            hooks = {**hooks, **{k: v for k, v in (entry.get("hooks") or {}).items() if v}}
+
         # ---- PATH A (v1.4.0): docker/Dockerfile.release present -> the build
         # IS a docker build (the proven buildx recipe), inside the engine
         # (BuildKit cache; depends-baker/app-builder layers stay cached across
