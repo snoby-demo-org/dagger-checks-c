@@ -540,8 +540,16 @@ def _toolchain() -> dagger.Container:
 
 
 async def _stage_commit_sha(source: dagger.Directory) -> str:
-    """Resolve the source tree's commit via git (works with a CI checkout;
-    empty string when .git is absent, e.g. fixture tests)."""
+    """Resolve the source tree's commit. Dagger directory sync EXCLUDES .git,
+    so in-container `git rev-parse` always fails on CI checkouts. The machinery
+    writes the commit to .truenorth_commit before `dagger call`; read that
+    first, fall back to git for local fixture use."""
+    try:
+        return (
+            await source.file(".truenorth_commit").contents()
+        ).strip()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         return (
             await dag.container()
