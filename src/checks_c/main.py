@@ -539,6 +539,22 @@ def _toolchain() -> dagger.Container:
     )
 
 
+async def _stage_commit_sha(source: dagger.Directory) -> str:
+    """Resolve the source tree's commit via git (works with a CI checkout;
+    empty string when .git is absent, e.g. fixture tests)."""
+    try:
+        return (
+            await dag.container()
+            .from_(TOOLCHAIN_IMAGE)
+            .with_mounted_directory("/src", source)
+            .with_workdir("/src")
+            .with_exec(["git", "rev-parse", "HEAD"])
+            .stdout()
+        ).strip()
+    except Exception:  # noqa: BLE001 — no .git (local fixture) -> sha-less tag
+        return ""
+
+
 @object_type
 class ChecksC:
     @function
