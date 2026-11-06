@@ -617,12 +617,20 @@ class ChecksC:
             except Exception as e:  # noqa: BLE001 — BuildKit failure text carries the tail
                 tail = "\n".join(str(e).splitlines()[-60:])
                 raise RuntimeError(f"build FAILED at stage=docker-build\n{tail}") from e
-            # GATE: binaries from the built image — ELF magic + version
-            verusd_bytes = await img.file("/usr/local/bin/verusd").contents()
-            if not verusd_bytes.startswith(b"\x7fELF"):
+            # GATE: binaries from the built image — ELF magic + version.
+            # Use an exec-based magic probe: verusd exceeds Dagger's 128 MiB
+            # file-contents limit, so .contents() on the binary fails outright.
+            magic = (
+                await img.with_entrypoint([])
+                .with_exec(["sh", "-c",
+                            "head -c 4 /usr/local/bin/verusd"
+                            " | od -An -tx1 | tr -d ' \\n'"])
+                .stdout()
+            ).strip()
+            if magic != "7f454c46":
                 raise RuntimeError(
-                    "build FAILED at stage=artifact-gate: /usr/local/bin/verusd "
-                    "in built image is not an ELF binary")
+                    f"build FAILED at stage=artifact-gate: /usr/local/bin/verusd "
+                    f"in built image is not an ELF binary (magic={magic!r})")
             try:
                 version = await (
                     img.with_entrypoint([])
