@@ -311,6 +311,46 @@ def _parse_artifact(text: str) -> str:
     return ""
 
 
+def _parse_publish(text: str) -> str:
+    """Extract build.publish from truenorth.yaml — the STAGING REPO REF to
+    publish the runtime image to after the artifact gate passes (e.g.
+    `publish: registry.viporlab.net/demo/verus-staging`). Empty string when
+    absent -> build stays compile+gate only (heavy builds never run on PRs,
+    but an undeclared key can never publish by construction).
+    """
+    top = None
+    seen_build = False
+    seen_matrix = False
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            top = key0.strip()
+            seen_build = top == "build" and not val0.strip()
+            seen_matrix = False
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if top not in ("checks", "build"):
+            continue
+        if key == "build" and not val:
+            seen_build = True
+            seen_matrix = False
+            continue
+        if key == "matrix" and not val and seen_build:
+            seen_matrix = True
+            continue
+        if seen_build and not seen_matrix and key == "publish" and val:
+            return _strip_outer_quotes(val)
+    return ""
+
+
 def _split_flow(s: str) -> list[str]:
     """Split a single-line YAML flow mapping body on top-level commas
     (quote-aware, escape-aware): 'MARCH: znver2, FOO: "a, b"' ->
@@ -465,6 +505,69 @@ def _toolchain() -> dagger.Container:
     )
 
 
+# Runtime layer (verbatim package list from veruscoin docker/Dockerfile.release
+# final stage) — assembled ON TOP of the already-gated binaries. This is the
+# cheap half of "build once, promote everywhere": the 40-90 min compile is the
+# artifact-gated build; packaging it into the image costs seconds.
+RUNTIME_IMAGE = "ubuntu:20.04"
+RUNTIME_APT = ("software-properties-common bash sudo libminiupnpc-dev "
+               "libzmq3-dev python3 python3-pip wget")
+
+
+async def _stage_commit_sha(source: dagger.Directory) -> str:
+    """Resolve the source tree's commit via git (works with a CI checkout;
+    empty string when .git is absent, e.g. fixture tests)."""
+    try:
+        return (
+            await dag.container()
+            .from_(TOOLCHAIN_IMAGE)
+            .with_mounted_directory("/src", source)
+            .with_workdir("/src")
+            .with_exec(["git", "rev-parse", "HEAD"])
+            .stdout()
+        ).strip()
+    except Exception:  # noqa: BLE001 — no .git (local fixture) -> sha-less tag
+        return ""
+
+
+async def _assemble_runtime_image(
+    source: dagger.Directory, verusd_path: str, verus_cli_path: str,
+    revision: str,
+) -> dagger.Container:
+    """Build the runtime image around the gated binaries (single recipe:
+    package list + entrypoint verbatim from the release Dockerfile's final
+    stage; the binaries come from the artifact-gated build tree, NOT a
+    second compile)."""
+    ctr = (
+        dag.container()
+        .from_(RUNTIME_IMAGE)
+        .with_exec(["sh", "-c",
+                    f"apt update && DEBIAN_FRONTEND=noninteractive apt install "
+                    f"--no-install-recommends -y {RUNTIME_APT} "
+                    f"&& rm -rf /var/lib/apt/lists/*"])
+        .with_exec(["pip3", "install", "flask", "requests"])
+        .with_exec(["sh", "-c",
+                    "useradd -m verus -s /bin/bash "
+                    "&& echo 'verus ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/verus"])
+        .with_file("/usr/local/bin/verusd", source.file(verusd_path))
+        .with_file("/usr/local/bin/verus", source.file(verus_cli_path))
+        .with_file("/usr/local/bin/fetch-params", source.file("zcutil/fetch-params.sh"))
+        .with_file("/usr/local/bin/fetch-bootstrap", source.file("vcutil/fetch-bootstrap.sh"))
+        .with_file("/verus-start-docker.sh", source.file("docker/verus-start-docker.sh"))
+        .with_file("/usr/local/bin/verus_health.py", source.file("docker/verus_health.py"))
+        .with_exec(["sh", "-c",
+                    "chmod +x /usr/local/bin/* /verus-start-docker.sh"])
+        .with_label("org.opencontainers.image.revision", revision)
+        .with_label("org.opencontainers.image.vendor", "snoby-demo-org/veruscoin")
+        .with_exposed_port(27486)
+        .with_exposed_port(27485)
+        .with_exposed_port(17772)
+        .with_exposed_port(8889)
+        .with_entrypoint(["/verus-start-docker.sh"])
+    )
+    return ctr
+
+
 @object_type
 class ChecksC:
     @function
@@ -490,8 +593,9 @@ class ChecksC:
             hooks = _parse_hooks(cfg)
             matrix = _parse_matrix(cfg)
             artifact = _parse_artifact(cfg)
+            publish_repo = _parse_publish(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
-            hooks, matrix, artifact = {}, {}, ""
+            hooks, matrix, artifact, publish_repo = {}, {}, "", ""
         venv: dict[str, str] = {}
         if variant:
             if variant not in matrix:
@@ -537,6 +641,33 @@ class ChecksC:
         lines.append(console.strip())
         if binary:
             lines.append(f"  version: {binary.splitlines()[0][:100]}")
+
+        # PUBLISH STAGE (v1.3.0): when the build block declares
+        # `publish: <staging-repo-ref>`, assemble the runtime image ON TOP of
+        # the gated binaries and push it (build once, promote everywhere —
+        # the digest feeds the digest.txt artifact the test plane and Kargo
+        # consume). Publish failure FAILS the check (blocking leg).
+        if publish_repo and status["status"] == "ok":
+            sha = await _stage_commit_sha(source)
+            tag = "sha-" + (sha or "unknown") + (f"-{variant}" if variant else "")
+            addr = f"{publish_repo}:{tag}"
+            lines.append(f"  staging: assembling runtime image -> {addr}")
+            # the ELF gate already proved the binaries exist (maxdepth 2);
+            # the standard autotools output dir is src/ (Dockerfile.release
+            # copies /build/src/verusd). Fail loudly if the layout differs.
+            for p in ("src/verusd", "src/verus"):
+                try:
+                    await source.file(p).size()
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"publish: gated binary '{p}' not found in build tree "
+                        f"(artifact gate passed, layout mismatch?): {e}") from e
+            img = await _assemble_runtime_image(source, "src/verusd", "src/verus", sha)
+            digest = await img.publish(addr)
+            payload["digest"] = digest
+            payload["staging"] = addr
+            lines.append(f"  staged: {addr}@{digest}")
+
         lines.append(f"TRUENORTH_RESULT: {json.dumps(payload)}")
         lines.append("=" * 50)
         if status["status"] != "ok":
