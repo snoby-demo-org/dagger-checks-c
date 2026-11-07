@@ -75,6 +75,7 @@ Run: dagger call --mod github.com/snoby-demo-org/dagger-checks-c build --source=
 """
 
 import json
+import re
 
 import dagger
 from dagger import dag, function, object_type
@@ -892,4 +893,65 @@ class ChecksC:
             raise RuntimeError(
                 f"build FAILED at stage={status['failed_stage']}\n{tail}"
             )
+        return "\n".join(lines)
+
+    @function
+    async def lint(self, source: dagger.Directory) -> str:
+        """REAL — cppcheck static analysis over the C/C++ source (fast tier).
+
+        Runs cppcheck (--enable=warning,performance) over the whole source
+        tree, counts findings by severity, emits the FR-7 TRUENORTH_RESULT
+        contract line, and raises when anything at severity 'error' exists
+        (style/performance noise is reported, not failed — the truenorth.yaml
+        mode decides blocking: advisory first per FR-12, flip to blocking
+        after the error budget has a baseline).
+
+        Wiring (v1.7.0): point the lint slot's module at this repo and enable
+        it — the machinery dispatches `dagger call --mod <module> lint` generically.
+        """
+        report = "/tmp/cppcheck.xml"
+        ctr = (
+            dag.container()
+            .from_("alpine:3.20")
+            .with_mounted_directory("/src", source)
+            .with_workdir("/src")
+            .with_exec(["sh", "-c",
+                        "apk add --no-cache cppcheck >/dev/null 2>&1 && "
+                        "cppcheck /src --enable=warning,performance "
+                        "--inline-suppr --std=c++17 --std=c11 -j\"$(nproc)\" "
+                        "-i/src/depends -i/src/secp256k1 -i/src/univalue "
+                        "-i/src/leveldb -i/src/qt -i/src/test "
+                        f"--error-exitcode=0 --xml --xml-version=2 "
+                        f"--output-file={report} >/dev/null 2>&1; "
+                        "grep -c '<error' " + report + " || true; "
+                        "grep -oE 'severity=\"[a-z]+\"' " + report + " | sort | uniq -c"])
+        )
+        console = await ctr.stdout()
+        counts: dict[str, int] = {}
+        for ln in console.splitlines():
+            m = re.match(r"\s*(\d+)\s*severity=\"(\w+)\"", ln)
+            if m:
+                counts[m.group(2)] = int(m.group(1))
+        total = sum(counts.values())
+        errors = counts.get("error", 0)
+        payload = {
+            "check": "lint",
+            "tool": "cppcheck@alpine3.20",
+            "total": total,
+            "counts": counts,
+            "status": "fail" if errors else "pass",
+        }
+        lines = [
+            "=" * 50,
+            " [lint] cppcheck (warning,performance)",
+            f"  findings: {total} {counts}",
+        ]
+        for ln in console.splitlines():
+            if "<error" in ln or "<warning" in ln:
+                lines.append("  " + ln.strip()[:160])
+        lines = lines[:40]
+        lines.append(f"TRUENORTH_RESULT: {json.dumps(payload)}")
+        lines.append("=" * 50)
+        if errors:
+            raise RuntimeError(f"cppcheck: {errors} finding(s) at severity=error (see job log)")
         return "\n".join(lines)
