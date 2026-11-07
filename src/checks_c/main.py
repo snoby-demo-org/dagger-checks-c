@@ -453,6 +453,12 @@ def _parse_scan(text: str) -> dict:
     return out
 
 
+# lint config lives at TOP LEVEL of truenorth.yaml (keys under checks: are
+# fanned out as jobs by the harness, so checks.lint-config would dispatch a
+# phantom `dagger call lint-config`). Accepted forms: top-level lint-config:
+# block, or a `lint:` block form under checks: (config keys alongside
+# enabled/mode/module). Not accepted: checks.lint-config sibling (v1.8.0
+# mistake — run 42373718960 fanned it out and failed on unknown command).
 def _parse_lint(text: str) -> dict:
     """Extract the checks.lint config block (v1.8.0 portability).
 
@@ -467,6 +473,7 @@ def _parse_lint(text: str) -> dict:
     with zero module changes; it declares its own layout here.
     """
     out: dict = {"std": "", "exclude": []}
+    lint_indent = 2
     top = None
     seen_checks = False
     seen_lint = False
@@ -476,12 +483,16 @@ def _parse_lint(text: str) -> dict:
         indent = len(ln) - len(ln.lstrip())
         stripped = ln.strip()
         if indent == 0:
-            key0, _, _ = stripped.partition(":")
+            key0, _, val0 = stripped.partition(":")
+            if key0.strip() == "lint-config" and not val0.strip():
+                seen_lint = True
+                lint_indent = indent
+                continue
             top = key0.strip()
             seen_checks = top == "checks"
             seen_lint = False
             continue
-        if not seen_checks:
+        if not seen_checks and not seen_lint:
             continue
         if not seen_lint:
             if ":" not in stripped:
@@ -490,9 +501,10 @@ def _parse_lint(text: str) -> dict:
             # accept either `lint:` block form or a sibling `lint-config:` block
             if key.strip() in ("lint", "lint-config") and not val.strip():
                 seen_lint = True
+                lint_indent = indent
             continue
         # inside the lint block
-        if indent <= 2:  # left the lint block
+        if indent <= lint_indent:  # left the lint block
             seen_lint = False
             continue
         if stripped.startswith("- "):
