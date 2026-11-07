@@ -385,6 +385,73 @@ def _parse_publish(text: str) -> str:
     return ""
 
 
+def _parse_scan(text: str) -> dict:
+    """Extract build.scan from truenorth.yaml — the image-vulnerability gate
+    config (v1.6.0). Runs Syft (SBOM) + Grype (CVE scan) on the gated image
+    BETWEEN the artifact gate and the staging publish, so a fail means no
+    staging tag is ever pushed (and therefore nothing reaches the Kargo
+    warehouse -> promotion chain).
+
+    Shape:
+      build:
+        scan:
+          enabled: true
+          fail_on: high,critical     # severities that fail the build
+          ignore_unfixed: true       # only fixable CVEs count (noise floor)
+          sbom_repo: registry.viporlab.net/demo/verus-sbom
+
+    Returns {} when absent/disabled -> zero behavior change for existing
+    pipelines (undeclared key can never gate by construction).
+    """
+    top = None
+    seen_build = False
+    seen_matrix = False
+    seen_scan = False
+    out: dict = {}
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, val0 = stripped.partition(":")
+            top = key0.strip()
+            seen_build = top == "build" and not val0.strip()
+            seen_matrix = False
+            seen_scan = False
+            continue
+        if top not in ("checks", "build") or ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if key == "build" and not val:
+            seen_build = True
+            seen_matrix = False
+            seen_scan = False
+            continue
+        if key == "matrix" and not val and seen_build:
+            seen_matrix = True
+            seen_scan = False
+            continue
+        if seen_build and not seen_matrix and key == "scan" and not val:
+            seen_scan = True
+            continue
+        if seen_scan:
+            if indent <= 2:  # left the scan block
+                seen_scan = False
+                continue
+            if key == "enabled":
+                out["enabled"] = val.lower() == "true"
+            elif key == "fail_on" and val:
+                out["fail_on"] = _strip_outer_quotes(val)
+            elif key == "ignore_unfixed":
+                out["ignore_unfixed"] = val.lower() == "true"
+            elif key == "sbom_repo" and val:
+                out["sbom_repo"] = _strip_outer_quotes(val)
+    return out
+
+
 def _split_flow(s: str) -> list[str]:
     """Split a single-line YAML flow mapping body on top-level commas
     (quote-aware, escape-aware): 'MARCH: znver2, FOO: "a, b"' ->
@@ -586,8 +653,10 @@ class ChecksC:
             artifact = _parse_artifact(cfg)
             publish_repo = _parse_publish(cfg)
             depends_image = _parse_build_key(cfg, "depends_image")
+            scan_cfg = _parse_scan(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
             hooks, matrix, artifact, publish_repo, depends_image = {}, {}, "", "", ""
+            scan_cfg = {}
         venv: dict[str, str] = {}
         if variant:
             if variant not in matrix:
@@ -705,6 +774,97 @@ class ChecksC:
             lines.append(console.strip())
             if binary:
                 lines.append(f"  version: {binary.splitlines()[0][:100]}")
+
+        # ---- IMAGE SCAN (v1.6.0): Syft SBOM + Grype CVE gate on the gated
+        # image, BEFORE the staging publish. A fail here means no staging tag
+        # is pushed at all — the Kargo warehouse/promotion chain never sees
+        # the artifact (promotion-not-rebuild: the scanned digest IS the
+        # the digest that gets promoted). Image is scanned via as_tarball (no
+        # registry round-trip). Grype DB rides a persistent cache volume so
+        # the ~100MB download is paid once per engine, not per run.
+        if scan_cfg.get("enabled") and status["status"] == "ok" and img is not None:
+            fail_on = [s.strip().lower() for s in str(scan_cfg.get("fail_on", "high,critical")).split(",") if s.strip()]
+            ignore_unfixed = bool(scan_cfg.get("ignore_unfixed", True))
+            sbom_repo = str(scan_cfg.get("sbom_repo", "")).rstrip("/")
+            lines.append("=" * 50)
+            lines.append(f" [build] image scan (syft+grype, fail_on={','.join(fail_on)}"
+                         f"{' , ignore-unfixed' if ignore_unfixed else ''})")
+            try:
+                tar_f = img.as_tarball()
+                syft_ctr = (
+                    dag.container()
+                    .from_("anchore/syft:latest")
+                    .with_mounted_file("/scan/scan.img", tar_f)
+                    .with_exec(["sh", "-c",
+                                "mkdir -p /out && syft /scan/scan.img -o cyclonedx-json --file /out/sbom.json"])
+                )
+                sbom_f = syft_ctr.file("/out/sbom.json")
+                # --fail-on takes ONE severity, not a list: pass the highest in
+                # fail_on and decide the full verdict from the parsed counts.
+                _sev_order = {"negligible": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+                top_sev = max(fail_on, key=lambda s: _sev_order.get(s, 9))
+                # anchore/grype is shell-less; wrap the binary in alpine so the
+                # DB cache dir mounts writable and diagnostics are capturable.
+                grype_ctr = (
+                    dag.container()
+                    .from_("alpine:3.20")
+                    .with_file("/bin/grype", dag.container().from_("anchore/grype:latest").file("/grype"))
+                    .with_mounted_file("/scan/scan.img", tar_f)
+                    .with_mounted_cache("/grype-db", dag.cache_volume("grype-db"))
+                    .with_env_variable("GRYPE_DB_CACHE_DIR", "/grype-db")
+                    .with_exec(["sh", "-c",
+                                "mkdir -p /out && grype /scan/scan.img -o json --file /out/grype.json "
+                                f"--fail-on {top_sev} {'--only-fixed' if ignore_unfixed else ''}"],
+                               expect=dagger.ReturnType.ANY)
+                )
+                # grype exits non-zero when fail-on severities are present:
+                # read the report either way, then decide on the counts.
+                report_raw = await grype_ctr.file("/out/grype.json").contents()
+                report = json.loads(report_raw)
+                matches = report.get("matches", [])
+                counts: dict[str, int] = {}
+                for m in matches:
+                    sev = ((m.get("vulnerability") or {}).get("severity") or "unknown").lower()
+                    counts[sev] = counts.get(sev, 0) + 1
+                failing = {s: counts.get(s, 0) for s in fail_on if counts.get(s)}
+                total = len(matches)
+                lines.append(f"  vulnerabilities: {total} matched"
+                             + (f"; failing: {failing}" if failing else "; none at fail-on severity"))
+                sbom_addr = ""
+                if sbom_repo:
+                    sbom_addr = f"{sbom_repo}:sha-{sha or 'unknown'}"
+                    await (
+                        dag.container()
+                        .from_("alpine:3.20")
+                        .with_file("/sbom.json", sbom_f)
+                        .with_label("org.opencontainers.image.title", "verus-sbom")
+                        .publish(sbom_addr)
+                    )
+                    lines.append(f"  sbom: {sbom_addr}")
+                    payload["sbom"] = sbom_addr
+                payload["scan"] = {"status": "pass" if not failing else "fail",
+                                   "counts": counts, "total": total}
+                if failing:
+                    top = sorted(matches, key=lambda m: -len(json.dumps(m)))[:10]
+                    summary = "\n".join(
+                        f"    {((m.get('vulnerability') or {}).get('id') or '?')} "
+                        f"[{((m.get('vulnerability') or {}).get('severity') or '?')}] "
+                        f"{((m.get('artifact') or {}).get('name') or '?')} "
+                        f"{(m.get('artifact') or {}).get('version') or ''} -> "
+                        f"{((m.get('vulnerability') or {}).get('fix', {}) or {}).get('versions') or 'no fix'}"
+                        for m in top)
+                    raise RuntimeError(
+                        f"build FAILED at stage=image-scan: vulnerabilities at "
+                        f"fail-on severity ({', '.join(f'{k}={v}' for k, v in failing.items())})\n"
+                        f"  no staging tag was pushed; fix or bump the base image, or\n"
+                        f"  adjust build.scan (fail_on / ignore_unfixed) in truenorth.yaml\n"
+                        f"  top findings:\n{summary}")
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001 — scan infrastructure failure is a hard fail
+                raise RuntimeError(
+                    f"build FAILED at stage=image-scan (infrastructure): {e}\n"
+                    f"  the gate cannot prove the image clean — no staging tag pushed (FR-59)") from e
 
         # ---- PUBLISH (v1.4.0): push the gated image itself by digest
         if publish_repo and status["status"] == "ok" and img is not None:
