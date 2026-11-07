@@ -472,7 +472,7 @@ def _parse_lint(text: str) -> dict:
     Nothing project-specific lives in the module: a new C project wires in
     with zero module changes; it declares its own layout here.
     """
-    out: dict = {"std": "", "exclude": []}
+    out: dict = {"std": [], "exclude": []}
     lint_indent = 2
     top = None
     seen_checks = False
@@ -484,7 +484,7 @@ def _parse_lint(text: str) -> dict:
         stripped = ln.strip()
         if indent == 0:
             key0, _, val0 = stripped.partition(":")
-            if key0.strip() == "lint-config" and not val0.strip():
+            if key0.strip() == "lint-config" and not val0.split("#")[0].strip():
                 seen_lint = True
                 lint_indent = indent
                 continue
@@ -499,7 +499,7 @@ def _parse_lint(text: str) -> dict:
                 continue
             key, _, val = stripped.partition(":")
             # accept either `lint:` block form or a sibling `lint-config:` block
-            if key.strip() in ("lint", "lint-config") and not val.strip():
+            if key.strip() in ("lint", "lint-config") and not val.split("#")[0].strip():
                 seen_lint = True
                 lint_indent = indent
             continue
@@ -518,10 +518,26 @@ def _parse_lint(text: str) -> dict:
         key = key.strip()
         val = val.strip()
         if key == "std" and val:
-            out["std"] = _strip_outer_quotes(val)
+            body = val.split("#")[0].strip()
+            if body.startswith("[") or "," in body:
+                out["std"] = [_strip_outer_quotes(v.strip())
+                              for v in body.strip("[]").split(",") if v.strip()]
+            else:
+                out["std"] = [_strip_outer_quotes(body)]
         elif key == "exclude" and val.split("#")[0].strip():
             out["exclude"] = [_strip_outer_quotes(v.strip())
                               for v in val.split("#")[0].strip("[]").split(",") if v.strip()]
+    # These values are interpolated into a `sh -c` cppcheck command line —
+    # fail LOUDLY on anything that isn't a plain path/standard token rather
+    # than risking command injection from a repo-controlled yaml.
+    import string as _string
+    _safe = set(_string.ascii_letters + _string.digits + "+._-/[]")
+    for s in out["std"]:
+        if not s or set(s) - _safe:
+            raise RuntimeError(f"lint-config std has unsafe characters: {s!r}")
+    for e in out["exclude"]:
+        if not e or set(e) - _safe:
+            raise RuntimeError(f"lint-config exclude has unsafe characters: {e!r}")
     return out
 
 
@@ -804,7 +820,7 @@ class ChecksC:
             binary = version
             payload = {
                 "check": "build",
-                "tool": "docker-build@docker/Dockerfile.release",
+                "tool": f"docker-build@{dockerfile}",
                 "status": "pass",
                 "failed_stage": None,
                 "warnings": 0,
@@ -812,7 +828,7 @@ class ChecksC:
             }
             if variant:
                 payload["variant"] = variant
-            lines = ["=" * 50, " [build] docker/Dockerfile.release (buildx recipe, in-engine)"]
+            lines = ["=" * 50, f" [build] {dockerfile} (buildx recipe, in-engine)"]
             if version:
                 lines.append(f"  version: {version[:100]}")
         else:
@@ -921,7 +937,8 @@ class ChecksC:
                         dag.container()
                         .from_("alpine:3.20")
                         .with_file("/sbom.json", sbom_f)
-                        .with_label("org.opencontainers.image.title", "verus-sbom")
+                        .with_label("org.opencontainers.image.title",
+                                    sbom_repo.rsplit("/", 1)[-1])
                         .publish(sbom_addr)
                     )
                     lines.append(f"  sbom: {sbom_addr}")
@@ -995,9 +1012,10 @@ class ChecksC:
         try:
             lint_cfg = _parse_lint(await source.file(".github/truenorth.yaml").contents())
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> generic defaults
-            lint_cfg = {"std": "", "exclude": []}
+            lint_cfg = {"std": [], "exclude": []}
         report = "/tmp/cppcheck.xml"
-        std_flag = f"--std={lint_cfg['std']} " if lint_cfg.get("std") else ""
+        std_flags = " ".join(f"--std={s}" for s in lint_cfg.get("std") or [])
+        std_flags = std_flags + " " if std_flags else ""
         ignore_flags = " ".join(f"-i/src/{d.strip('/')}" for d in lint_cfg.get("exclude", []))
         ctr = (
             dag.container()
@@ -1007,7 +1025,7 @@ class ChecksC:
             .with_exec(["sh", "-c",
                         "apk add --no-cache cppcheck >/dev/null 2>&1 && "
                         "cppcheck /src --enable=warning,performance "
-                        f"--inline-suppr {std_flag}-j\"$(nproc)\" "
+                        f"--inline-suppr {std_flags}-j\"$(nproc)\" "
                         f"{ignore_flags} "
                         f"--error-exitcode=0 --xml --xml-version=2 "
                         f"--output-file={report} >/dev/null 2>&1; "
