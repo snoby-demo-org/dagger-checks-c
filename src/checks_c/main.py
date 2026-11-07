@@ -453,6 +453,66 @@ def _parse_scan(text: str) -> dict:
     return out
 
 
+def _parse_lint(text: str) -> dict:
+    """Extract the checks.lint config block (v1.8.0 portability).
+
+    Shape (all keys optional, no block = fully generic defaults):
+      lint:
+        std: c++17            # passed as --std=<std> (cppcheck accepts one)
+        exclude:              # dirs relative to repo root, NOT linted
+          - depends
+          - src/secp256k1
+
+    Nothing project-specific lives in the module: a new C project wires in
+    with zero module changes; it declares its own layout here.
+    """
+    out: dict = {"std": "", "exclude": []}
+    top = None
+    seen_checks = False
+    seen_lint = False
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        stripped = ln.strip()
+        if indent == 0:
+            key0, _, _ = stripped.partition(":")
+            top = key0.strip()
+            seen_checks = top == "checks"
+            seen_lint = False
+            continue
+        if not seen_checks:
+            continue
+        if not seen_lint:
+            if ":" not in stripped:
+                continue
+            key, _, val = stripped.partition(":")
+            # accept either `lint:` block form or a sibling `lint-config:` block
+            if key.strip() in ("lint", "lint-config") and not val.strip():
+                seen_lint = True
+            continue
+        # inside the lint block
+        if indent <= 2:  # left the lint block
+            seen_lint = False
+            continue
+        if stripped.startswith("- "):
+            item = _strip_outer_quotes(stripped[2:].split("#")[0].strip())
+            if item:
+                out["exclude"].append(item)
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if key == "std" and val:
+            out["std"] = _strip_outer_quotes(val)
+        elif key == "exclude" and val.split("#")[0].strip():
+            out["exclude"] = [_strip_outer_quotes(v.strip())
+                              for v in val.split("#")[0].strip("[]").split(",") if v.strip()]
+    return out
+
+
 def _split_flow(s: str) -> list[str]:
     """Split a single-line YAML flow mapping body on top-level commas
     (quote-aware, escape-aware): 'MARCH: znver2, FOO: "a, b"' ->
@@ -654,10 +714,18 @@ class ChecksC:
             artifact = _parse_artifact(cfg)
             publish_repo = _parse_publish(cfg)
             depends_image = _parse_build_key(cfg, "depends_image")
+            # v1.8.0 portability knobs — no project paths in the module:
+            #   dockerfile:    path to the Dockerfile for the docker-build path
+            #   artifact_path: binary path INSIDE the built image (gate probe)
+            # Defaults keep back-compat: veruscoin's layout verbatim.
+            dockerfile = _parse_build_key(cfg, "dockerfile") or "docker/Dockerfile.release"
+            artifact_path = _parse_build_key(cfg, "artifact_path") or (
+                f"/usr/local/bin/{artifact}" if artifact else "/usr/local/bin/artifact")
             scan_cfg = _parse_scan(cfg)
         except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> legacy path
             hooks, matrix, artifact, publish_repo, depends_image = {}, {}, "", "", ""
             scan_cfg = {}
+            dockerfile, artifact_path = "docker/Dockerfile.release", "/usr/local/bin/artifact"
         venv: dict[str, str] = {}
         if variant:
             if variant not in matrix:
@@ -675,7 +743,7 @@ class ChecksC:
         # pushes that SAME image by digest. Build once, promote everywhere.
         dockerfile_present = True
         try:
-            await source.file("docker/Dockerfile.release").size()
+            await source.file(dockerfile).size()
         except Exception:  # noqa: BLE001
             dockerfile_present = False
 
@@ -686,7 +754,7 @@ class ChecksC:
             if depends_image:
                 bargs.append(dagger.BuildArg(name="DEPENDS_IMAGE", value=depends_image))
             build_kwargs = {
-                "dockerfile": "docker/Dockerfile.release",
+                "dockerfile": dockerfile,
                 "build_args": bargs,
                 "secrets": [],
             }
@@ -696,30 +764,30 @@ class ChecksC:
                 tail = "\n".join(str(e).splitlines()[-60:])
                 raise RuntimeError(f"build FAILED at stage=docker-build\n{tail}") from e
             # GATE: binaries from the built image — ELF magic + version.
-            # Use an exec-based magic probe: verusd exceeds Dagger's 128 MiB
+            # Use an exec-based magic probe: the artifact exceeds Dagger's 128 MiB
             # file-contents limit, so .contents() on the binary fails outright.
             magic = (
                 await img.with_entrypoint([])
                 .with_exec(["sh", "-c",
-                            "head -c 4 /usr/local/bin/verusd"
+                            f"head -c 4 {artifact_path}"
                             " | od -An -tx1 | tr -d ' \\n'"])
                 .stdout()
             ).strip()
             if magic != "7f454c46":
                 raise RuntimeError(
-                    f"build FAILED at stage=artifact-gate: /usr/local/bin/verusd "
+                    f"build FAILED at stage=artifact-gate: {artifact_path} "
                     f"in built image is not an ELF binary (magic={magic!r})")
             try:
                 version = await (
                     img.with_entrypoint([])
                     .with_exec(["sh", "-c",
-                                "/usr/local/bin/verusd --version 2>&1 | head -1"])
+                                f"{artifact_path} --version 2>&1 | head -1"])
                     .stdout()
                 )
                 version = version.strip()
             except Exception as e:  # noqa: BLE001
                 version = ""
-                lines = [f"  WARN: verusd --version probe failed: {e}"]
+                lines = [f"  WARN: {artifact_path} --version probe failed: {e}"]
             status = {"status": "ok", "failed_stage": None, "warnings": 0}
             binary = version
             payload = {
@@ -908,8 +976,17 @@ class ChecksC:
 
         Wiring (v1.7.0): point the lint slot's module at this repo and enable
         it — the machinery dispatches `dagger call --mod <module> lint` generically.
+        Layout knobs (v1.8.0) come from checks.lint in truenorth.yaml:
+        std (compiler std passed to --std) and exclude (repo-relative dirs to
+        skip — vendored/third-party code). Defaults: no --std flag, no excludes.
         """
+        try:
+            lint_cfg = _parse_lint(await source.file(".github/truenorth.yaml").contents())
+        except Exception:  # noqa: BLE001 — no/unreadable truenorth.yaml -> generic defaults
+            lint_cfg = {"std": "", "exclude": []}
         report = "/tmp/cppcheck.xml"
+        std_flag = f"--std={lint_cfg['std']} " if lint_cfg.get("std") else ""
+        ignore_flags = " ".join(f"-i/src/{d.strip('/')}" for d in lint_cfg.get("exclude", []))
         ctr = (
             dag.container()
             .from_("alpine:3.20")
@@ -918,9 +995,8 @@ class ChecksC:
             .with_exec(["sh", "-c",
                         "apk add --no-cache cppcheck >/dev/null 2>&1 && "
                         "cppcheck /src --enable=warning,performance "
-                        "--inline-suppr --std=c++17 --std=c11 -j\"$(nproc)\" "
-                        "-i/src/depends -i/src/secp256k1 -i/src/univalue "
-                        "-i/src/leveldb -i/src/qt -i/src/test "
+                        f"--inline-suppr {std_flag}-j\"$(nproc)\" "
+                        f"{ignore_flags} "
                         f"--error-exitcode=0 --xml --xml-version=2 "
                         f"--output-file={report} >/dev/null 2>&1; "
                         "grep -c '<error' " + report + " || true; "
