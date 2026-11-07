@@ -791,9 +791,12 @@ class ChecksC:
                          f"{' , ignore-unfixed' if ignore_unfixed else ''})")
             try:
                 tar_f = img.as_tarball()
+                # anchore/syft is shell-less too (v1.6.1): wrap the binary in
+                # alpine so sh -c can mkdir -p /out (syft's --file won't).
                 syft_ctr = (
                     dag.container()
-                    .from_("anchore/syft:latest")
+                    .from_("alpine:3.20")
+                    .with_file("/bin/syft", dag.container().from_("anchore/syft:latest").file("/syft"))
                     .with_mounted_file("/scan/scan.img", tar_f)
                     .with_exec(["sh", "-c",
                                 "mkdir -p /out && syft /scan/scan.img -o cyclonedx-json --file /out/sbom.json"])
