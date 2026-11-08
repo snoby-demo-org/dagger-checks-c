@@ -1047,6 +1047,10 @@ class ChecksC:
                         f"--error-exitcode=0 --xml --xml-version=2 "
                         f"--output-file={report} >/dev/null 2>&1; "
                         "grep -c '<error' " + report + " || true; "
+                        # v1.8.4: surface per-finding detail (id/file/line) —
+                        # the XML went only to --output-file before, so job
+                        # logs showed counts but never WHICH findings.
+                        "grep -oE '<error[^>]{0,160}' " + report + " | head -30; "
                         "grep -oE 'severity=\"[a-z]+\"' " + report + " | sort | uniq -c"])
         )
         console = await ctr.stdout()
