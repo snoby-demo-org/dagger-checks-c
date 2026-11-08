@@ -1046,11 +1046,14 @@ class ChecksC:
                         f"{ignore_flags} "
                         f"--error-exitcode=0 --xml --xml-version=2 "
                         f"--output-file={report} >/dev/null 2>&1; "
-                        "grep -c '<error' " + report + " || true; "
-                        # v1.8.4: surface per-finding detail (id/file/line) —
+                        "grep -c 'severity=\"error\"' " + report + " || true; "
+                        # v1.8.4/5: surface per-finding detail (id/file/line) —
                         # the XML went only to --output-file before, so job
-                        # logs showed counts but never WHICH findings.
-                        "grep -oE '<error[^>]{0,160}' " + report + " | head -30; "
+                        # logs showed counts but never WHICH findings. Every
+                        # cppcheck XML entry is an <error> element with a
+                        # severity ATTRIBUTE — filter to severity="error".
+                        "grep -oE '<error[^>]{0,160}' " + report
+                        + " | grep 'severity=\"error\"' | head -30; "
                         "grep -oE 'severity=\"[a-z]+\"' " + report + " | sort | uniq -c"])
         )
         console = await ctr.stdout()
