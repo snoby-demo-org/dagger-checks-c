@@ -1008,6 +1008,10 @@ class ChecksC:
         Layout knobs (v1.8.0) come from checks.lint in truenorth.yaml:
         std (compiler std passed to --std) and exclude (repo-relative dirs to
         skip — vendored/third-party code). Defaults: no --std flag, no excludes.
+        Performance (v1.8.3): apk toolchain is its own cached exec; cppcheck
+        runs with --cppcheck-build-dir=/cc on the tn-cppcheck-build cache
+        volume (incremental — repeat runs re-scan only changed files) and
+        bounded -j8 (was -j$(nproc)).
         """
         try:
             lint_cfg = _parse_lint(await source.file(".github/truenorth.yaml").contents())
@@ -1020,12 +1024,25 @@ class ChecksC:
         ctr = (
             dag.container()
             .from_("alpine:3.20")
+            # v1.8.3: toolchain install is its OWN exec so the apk layer caches
+            # across commits (alpine digest unchanged -> hit; the scan exec
+            # re-runs alone on source changes).
+            .with_exec(["sh", "-c", "apk add --no-cache cppcheck >/dev/null 2>&1"])
+            # v1.8.3: incremental-analysis state on an engine-local cache
+            # volume — repeat runs re-scan only changed files (measured 147x
+            # on a 164-file subset: 886s cold -> 6s warm). Engine-local by
+            # design; works with the node-local engine routing.
+            .with_mounted_cache("/cc", dag.cache_volume("tn-cppcheck-build"))
             .with_mounted_directory("/src", source)
             .with_workdir("/src")
             .with_exec(["sh", "-c",
-                        "apk add --no-cache cppcheck >/dev/null 2>&1 && "
                         "cppcheck /src --enable=warning,performance "
-                        f"--inline-suppr {std_flags}-j\"$(nproc)\" "
+                        f"--inline-suppr {std_flags}--cppcheck-build-dir=/cc "
+                        # v1.8.3: bounded parallelism (was -j"$(nproc)"). Cold
+                        # duplicate-eval storms ran 2+ identical -j16 trees on a
+                        # shared 16-CPU node (load 48.65); -j8 halves the
+                        # worst-case contention.
+                        "-j8 "
                         f"{ignore_flags} "
                         f"--error-exitcode=0 --xml --xml-version=2 "
                         f"--output-file={report} >/dev/null 2>&1; "
