@@ -1091,5 +1091,5 @@ class ChecksC:
             # crash channel (FR-59: a leg that dies before reporting cannot
             # prove itself clean).
             print(f"::warning::cppcheck: {errors} finding(s) at severity=error "
-                  f"(declared status=fail — advisory, see job log)")
+                  f"(declared status=fail, see job log)")
         return "\n".join(lines)
