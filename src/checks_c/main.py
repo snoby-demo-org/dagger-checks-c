@@ -1083,5 +1083,13 @@ class ChecksC:
         lines.append(f"TRUENORTH_RESULT: {json.dumps(payload)}")
         lines.append("=" * 50)
         if errors:
-            raise RuntimeError(f"cppcheck: {errors} finding(s) at severity=error (see job log)")
+            # v1.8.6: declare, don't raise. The TRUENORTH_RESULT contract line
+            # above already carries status:"fail"; raising produced an
+            # "Unhandled exception" traceback that reads as a plugin crash and
+            # kept the job visibly "running" through the teardown tail. The
+            # harness (truenorth-v2.6+) honors a declared status; rc stays the
+            # crash channel (FR-59: a leg that dies before reporting cannot
+            # prove itself clean).
+            print(f"::warning::cppcheck: {errors} finding(s) at severity=error "
+                  f"(declared status=fail — advisory, see job log)")
         return "\n".join(lines)
